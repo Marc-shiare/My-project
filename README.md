@@ -36,6 +36,14 @@ cmd /c npm test
 
 This repository is set up to work with the portable Git install stored under `tools/git-portable`.
 
+On Windows Command Prompt, use:
+
+```bat
+scripts\git-portable.cmd status
+scripts\git-portable.cmd pull --ff-only
+scripts\git-portable.cmd push
+```
+
 From PowerShell, use:
 
 ```powershell
@@ -44,7 +52,9 @@ From PowerShell, use:
 .\scripts\git-portable.ps1 push
 ```
 
-If `tools/git-portable` is missing, restore the portable Git download before using the helper script.
+The `.cmd` helper is the safest default on Windows because it passes Git flags like `-v` through without PowerShell parsing them first.
+
+If `tools/git-portable` is missing, restore the portable Git download before using the helper scripts.
 
 ## Architecture Notes
 
