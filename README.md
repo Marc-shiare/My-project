@@ -32,6 +32,20 @@ Open [http://localhost:3000](http://localhost:3000)
 cmd /c npm test
 ```
 
+## Git Workflow
+
+This repository is set up to work with the portable Git install stored under `tools/git-portable`.
+
+From PowerShell, use:
+
+```powershell
+.\scripts\git-portable.ps1 status
+.\scripts\git-portable.ps1 pull --ff-only
+.\scripts\git-portable.ps1 push
+```
+
+If `tools/git-portable` is missing, restore the portable Git download before using the helper script.
+
 ## Architecture Notes
 
 The platform uses a file-backed event store in [`data/events.jsonl`](data/events.jsonl). This is appropriate for a reference implementation and local resilience testing; production deployment should replace the storage adapter with a transactional database while keeping the same event contracts.
