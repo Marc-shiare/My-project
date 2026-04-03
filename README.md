@@ -34,9 +34,9 @@ cmd /c npm test
 
 ## Architecture Notes
 
-The platform uses a file-backed event store in [`data/events.jsonl`](D:\myproject\data\events.jsonl). This is appropriate for a reference implementation and local resilience testing; production deployment should replace the storage adapter with a transactional database while keeping the same event contracts.
+The platform uses a file-backed event store in [`data/events.jsonl`](data/events.jsonl). This is appropriate for a reference implementation and local resilience testing; production deployment should replace the storage adapter with a transactional database while keeping the same event contracts.
 
-Business and architecture analysis is documented in [docs/architecture.md](D:\myproject\docs\architecture.md).
+Business and architecture analysis is documented in [docs/architecture.md](docs/architecture.md).
 
 ## Demo Personas
 
@@ -51,4 +51,4 @@ The UI includes built-in personas to exercise governance rules:
 
 ## External Boundaries
 
-Banking rails, mobile money, insurer core systems, and identity providers are not implemented as fake APIs. Instead, explicit adapter boundaries are defined in [src/adapters/ports.mjs](D:\myproject\src\adapters\ports.mjs). The current build uses manual confirmation and file-based imports until real specifications are available.
+Banking rails, mobile money, insurer core systems, and identity providers are not implemented as fake APIs. Instead, explicit adapter boundaries are defined in [src/adapters/ports.mjs](src/adapters/ports.mjs). The current build uses manual confirmation and file-based imports until real specifications are available.
