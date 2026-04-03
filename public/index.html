@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#12354a" />
+    <title>Claims And Reconciliation Control Room</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Self-Healing Claims and Reconciliation Platform</p>
+          <h1>Integrity-first operations for claims, payouts, and cash breaks.</h1>
+          <p class="hero-copy">
+            Event sourced, immutable, offline-capable, and built to keep dual control intact even under weak connectivity.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="seed-demo" class="primary">Seed Demo Scenario</button>
+          <button id="run-self-heal" class="secondary">Run Self-Heal</button>
+        </div>
+      </header>
+
+      <section class="persona-panel">
+        <label for="persona-select">Active Persona</label>
+        <select id="persona-select"></select>
+        <p id="network-state">Checking connectivity...</p>
+        <p id="queue-state">Offline queue: 0 pending command(s)</p>
+      </section>
+
+      <section id="status-banner" class="status-banner hidden"></section>
+
+      <section class="grid summary-grid" id="summary-grid"></section>
+
+      <main class="grid main-grid">
+        <section class="card">
+          <div class="section-head">
+            <h2>Submit Claim</h2>
+            <p>Captures original business facts before adjudication.</p>
+          </div>
+          <form id="claim-form" class="stacked-form">
+            <input name="tenantId" value="demo-insurer-ke" placeholder="Tenant ID" required />
+            <input name="policyRef" placeholder="Policy Reference" required />
+            <input name="memberRef" placeholder="Member Reference" required />
+            <input name="providerRef" placeholder="Provider Reference" required />
+            <input name="incidentDate" type="date" required />
+            <input name="amountMinor" type="number" min="0" step="1" placeholder="Amount in minor units" required />
+            <input name="currency" value="KES" maxlength="3" required />
+            <textarea name="narrative" rows="3" placeholder="Narrative" required></textarea>
+            <button type="submit" class="primary">Submit Claim</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <h2>Import Reconciliation Batch</h2>
+            <p>Manual upload boundary until bank and switch specs are available.</p>
+          </div>
+          <form id="recon-form" class="stacked-form">
+            <input name="sourceSystem" value="MANUAL_BANK_UPLOAD" placeholder="Source System" required />
+            <input name="accountRef" value="KES-OPERATIONS-001" placeholder="Account Reference" required />
+            <input name="statementDate" type="date" required />
+            <textarea
+              name="lines"
+              rows="8"
+              placeholder='[{"externalReference":"PAY-KE-0003","narrative":"Payment","amountMinor":100000,"currency":"KES","direction":"DEBIT","valueDate":"2026-04-03","channelType":"BANK_TRANSFER"}]'
+              required
+            ></textarea>
+            <button type="submit" class="secondary">Import Batch</button>
+          </form>
+        </section>
+
+        <section class="card wide">
+          <div class="section-head">
+            <h2>Claims Workbench</h2>
+            <p>Use action buttons with the right persona to move each claim through governance checkpoints.</p>
+          </div>
+          <div id="claims-table" class="table-shell"></div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <h2>Exceptions</h2>
+            <p>Only low-risk exact matches auto-resolve. Everything else lands here.</p>
+          </div>
+          <div id="exceptions-list" class="list-shell"></div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <h2>Ledger</h2>
+            <p>Immutable financial postings derived from adjudication and settlement events.</p>
+          </div>
+          <div id="ledger-list" class="list-shell"></div>
+        </section>
+
+        <section class="card wide">
+          <div class="section-head">
+            <h2>Recent Events</h2>
+            <p>Hash-chained event history for audit inspection.</p>
+          </div>
+          <div id="events-list" class="events-shell"></div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

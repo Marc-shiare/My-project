@@ -1,0 +1,9 @@
+{
+  "name": "Claims Control Room",
+  "short_name": "ClaimsControl",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f3ed",
+  "theme_color": "#12354a",
+  "icons": []
+}
