@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
-    "test": "node test/platform.test.mjs"
+    "test": "node test/all-tests.mjs"
   },
   "engines": {
     "node": ">=24.0.0"

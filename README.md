@@ -61,6 +61,29 @@ If `tools/git-portable` is missing, restore the portable Git download before usi
 The platform uses a file-backed event store in [`data/events.jsonl`](data/events.jsonl). This is appropriate for a reference implementation and local resilience testing; production deployment should replace the storage adapter with a transactional database while keeping the same event contracts.
 
 Business and architecture analysis is documented in [docs/architecture.md](docs/architecture.md).
+Phase One ledger foundation details are documented in [docs/phase-1-core-ledger-foundation.md](docs/phase-1-core-ledger-foundation.md).
+The production Postgres event store schema is documented in [docs/postgres-event-store-schema.sql](docs/postgres-event-store-schema.sql).
+
+## Storage Modes
+
+Local development defaults to the file-backed event store plus file-backed projection checkpoints.
+
+Production mode can be enabled with:
+
+```bash
+EVENT_STORE_DRIVER=postgres
+DATABASE_URL=postgres://user:password@host:5432/database
+```
+
+Optional environment variables:
+
+- `EVENT_STORE_SCHEMA` defaults to `public`
+- `EVENT_STORE_TABLE` defaults to `event_store`
+- `PROJECTION_CHECKPOINT_TABLE` defaults to `projection_checkpoints`
+- `POSTGRES_POOL_MAX` defaults to `10`
+- `POSTGRES_SSL=require` enables TLS in hosted environments
+
+When `EVENT_STORE_DRIVER=postgres`, install the `pg` package and apply [docs/postgres-event-store-schema.sql](docs/postgres-event-store-schema.sql) before starting the service.
 
 ## Demo Personas
 

@@ -33,6 +33,28 @@ export class ProjectionStore {
     }
   }
 
+  restoreState(state, integrity = { ok: true, eventCount: 0, lastHash: "GENESIS" }) {
+    this.reset();
+    this.claims = new Map((state.claims ?? []).map(([key, value]) => [key, clone(value)]));
+    this.batches = new Map((state.batches ?? []).map(([key, value]) => [key, clone(value)]));
+    this.cases = new Map((state.cases ?? []).map(([key, value]) => [key, clone(value)]));
+    this.ledgerEntries = (state.ledgerEntries ?? []).map(clone);
+    this.commandIds = new Set(state.commandIds ?? []);
+    this.events = (state.recentEvents ?? []).map(clone);
+    this.integrity = integrity;
+  }
+
+  exportState() {
+    return {
+      claims: [...this.claims.entries()].map(([key, value]) => [key, clone(value)]),
+      batches: [...this.batches.entries()].map(([key, value]) => [key, clone(value)]),
+      cases: [...this.cases.entries()].map(([key, value]) => [key, clone(value)]),
+      ledgerEntries: this.ledgerEntries.map(clone),
+      commandIds: [...this.commandIds],
+      recentEvents: this.events.slice(-100).map(clone),
+    };
+  }
+
   applyEvent(event) {
     this.events.push(event);
     if (event.metadata?.commandId) {

@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ClaimsPlatform } from "./application/platform.mjs";
-import { FileEventStore } from "./infrastructure/file-event-store.mjs";
+import { createEventInfrastructure } from "./infrastructure/event-store-factory.mjs";
 import { ProjectionStore } from "./infrastructure/projection-store.mjs";
 import { normalizeError } from "./lib/errors.mjs";
 
@@ -13,11 +13,18 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
 const dataFile = path.join(rootDir, "data", "events.jsonl");
+const checkpointFile = path.join(rootDir, "data", "projection-checkpoints.json");
 const port = Number(process.env.PORT ?? 3000);
 
+const infrastructure = await createEventInfrastructure({
+  dataFile,
+  checkpointFile,
+});
+
 const platform = new ClaimsPlatform({
-  eventStore: new FileEventStore(dataFile),
+  eventStore: infrastructure.eventStore,
   projections: new ProjectionStore(),
+  checkpointStore: infrastructure.checkpointStore,
 });
 
 await platform.init();
@@ -185,3 +192,10 @@ const server = createServer(async (request, response) => {
 server.listen(port, () => {
   console.log(`Self-healing claims platform running at http://localhost:${port}`);
 });
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    await infrastructure.close();
+    process.exit(0);
+  });
+}

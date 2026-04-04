@@ -41,15 +41,35 @@ function payoutLedgerLines(claimId, amountMinor) {
 }
 
 export class ClaimsPlatform {
-  constructor({ eventStore, projections, adapters = createManualAdapters() }) {
+  constructor({
+    eventStore,
+    projections,
+    adapters = createManualAdapters(),
+    checkpointStore = null,
+    projectionName = "claims-platform",
+    checkpointEvery = 100,
+  }) {
     this.eventStore = eventStore;
     this.projections = projections;
     this.adapters = adapters;
+    this.checkpointStore = checkpointStore;
+    this.projectionName = projectionName;
+    this.checkpointEvery = checkpointEvery;
+    this.lastCheckpointPosition = 0;
   }
 
   async init() {
     await this.eventStore.init();
-    this.projections.rebuild(this.eventStore.getEvents(), this.eventStore.verifyIntegrity());
+    const integrity = this.eventStore.verifyIntegrity();
+    const checkpoint = this.checkpointStore ? await this.checkpointStore.load(this.projectionName) : null;
+    if (checkpoint && checkpoint.lastGlobalPosition <= this.#getLastGlobalPosition()) {
+      this.projections.restoreState(checkpoint.snapshot, checkpoint.integrity ?? integrity);
+      this.projections.applyEvents(this.eventStore.getEventsAfter(checkpoint.lastGlobalPosition));
+      this.lastCheckpointPosition = checkpoint.lastGlobalPosition;
+      return;
+    }
+
+    this.projections.rebuild(this.eventStore.getEvents(), integrity);
   }
 
   getSnapshot() {
@@ -87,7 +107,7 @@ export class ClaimsPlatform {
       correlationId: claimId,
       events: [{ eventType: "ClaimSubmitted", payload }],
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
@@ -118,7 +138,7 @@ export class ClaimsPlatform {
       correlationId: claimId,
       events: [{ eventType: "ClaimValidated", payload }],
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
@@ -175,7 +195,7 @@ export class ClaimsPlatform {
       correlationId: claimId,
       events,
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
@@ -240,7 +260,7 @@ export class ClaimsPlatform {
         },
       ],
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
@@ -279,7 +299,7 @@ export class ClaimsPlatform {
         },
       ],
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
@@ -329,7 +349,7 @@ export class ClaimsPlatform {
         },
       ],
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
@@ -391,7 +411,7 @@ export class ClaimsPlatform {
         },
       ],
     });
-    this.projections.applyEvents(batchResult.events);
+    await this.#applyAndCheckpoint(batchResult.events);
 
     for (const line of normalizedLines) {
       const caseId = createId("rcc");
@@ -421,7 +441,7 @@ export class ClaimsPlatform {
           },
         ],
       });
-      this.projections.applyEvents(lineResult.events);
+      await this.#applyAndCheckpoint(lineResult.events);
     }
 
     return { batch: this.projections.getBatch(batchId), deduplicated: false };
@@ -496,7 +516,7 @@ export class ClaimsPlatform {
             },
           ],
         });
-        this.projections.applyEvents(result.events);
+        await this.#applyAndCheckpoint(result.events);
         autoMatches += 1;
         continue;
       }
@@ -528,7 +548,7 @@ export class ClaimsPlatform {
             },
           ],
         });
-        this.projections.applyEvents(result.events);
+        await this.#applyAndCheckpoint(result.events);
         exceptionsOpened += 1;
         continue;
       }
@@ -563,7 +583,7 @@ export class ClaimsPlatform {
           },
         ],
       });
-      this.projections.applyEvents(result.events);
+      await this.#applyAndCheckpoint(result.events);
       exceptionsOpened += 1;
     }
 
@@ -616,7 +636,7 @@ export class ClaimsPlatform {
           },
         ],
       });
-      this.projections.applyEvents(result.events);
+      await this.#applyAndCheckpoint(result.events);
       exceptionsOpened += 1;
     }
 
@@ -665,7 +685,7 @@ export class ClaimsPlatform {
         },
       ],
     });
-    this.projections.applyEvents(result.events);
+    await this.#applyAndCheckpoint(result.events);
     return { case: this.projections.getCase(caseId), deduplicated: false };
   }
 
@@ -821,6 +841,11 @@ export class ClaimsPlatform {
     return this.adapters.identityContextPort.resolveActor(ensureActor(actor));
   }
 
+  async #applyAndCheckpoint(events) {
+    this.projections.applyEvents(events);
+    await this.#maybeCheckpoint();
+  }
+
   #requireClaim(claimId) {
     const claim = this.projections.getClaim(claimId);
     if (!claim) {
@@ -835,5 +860,31 @@ export class ClaimsPlatform {
       exceptionsOpened,
       generatedAt: new Date().toISOString(),
     };
+  }
+
+  #getLastGlobalPosition() {
+    if (typeof this.eventStore.getLastGlobalPosition === "function") {
+      return this.eventStore.getLastGlobalPosition();
+    }
+    return this.eventStore.getEvents().length;
+  }
+
+  async #maybeCheckpoint(force = false) {
+    if (!this.checkpointStore) {
+      return;
+    }
+
+    const currentPosition = this.#getLastGlobalPosition();
+    if (!force && currentPosition - this.lastCheckpointPosition < this.checkpointEvery) {
+      return;
+    }
+
+    await this.checkpointStore.save({
+      projectionName: this.projectionName,
+      lastGlobalPosition: currentPosition,
+      integrity: this.eventStore.verifyIntegrity(),
+      snapshot: this.projections.exportState(),
+    });
+    this.lastCheckpointPosition = currentPosition;
   }
 }

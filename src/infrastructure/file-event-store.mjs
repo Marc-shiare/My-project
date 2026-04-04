@@ -1,19 +1,17 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { stableSerialize } from "../lib/json.mjs";
 import { ConflictError, IntegrityError, ValidationError } from "../lib/errors.mjs";
 import { validateEventContract } from "../domain/event-catalog.mjs";
+import { computeEventHash, verifyEventChain } from "./hash-chain.mjs";
 
 export class FileEventStore {
-  constructor(filePath) {
+  constructor(filePath, options = {}) {
     this.filePath = filePath;
-    this.events = [];
-    this.streamVersions = new Map();
-    this.commandIds = new Set();
-    this.lastHash = "GENESIS";
+    this.validateEvent = options.validateEvent ?? validateEventContract;
     this.queue = Promise.resolve();
+    this.#resetIndexes();
   }
 
   async init() {
@@ -35,67 +33,57 @@ export class FileEventStore {
     });
 
     this.#rebuildIndexes(parsedEvents);
-    const integrity = this.verifyIntegrity();
+    const integrity = this.verifyIntegrity({ force: true });
     if (!integrity.ok) {
       throw new IntegrityError("Event log hash verification failed.", integrity);
     }
   }
 
-  #rebuildIndexes(events) {
+  #resetIndexes() {
     this.events = [];
+    this.eventIndex = new Map();
     this.streamVersions = new Map();
+    this.streamIndex = new Map();
     this.commandIds = new Set();
     this.lastHash = "GENESIS";
-
-    for (const event of events) {
-      this.events.push(event);
-      const streamId = `${event.aggregateType}:${event.aggregateId}`;
-      this.streamVersions.set(streamId, event.aggregateVersion);
-      if (event.metadata?.commandId) {
-        this.commandIds.add(event.metadata.commandId);
-      }
-      this.lastHash = event.metadata.hash;
-    }
+    this.integrityCache = { ok: true, eventCount: 0, lastHash: "GENESIS" };
+    this.integrityDirty = false;
   }
 
-  verifyIntegrity() {
-    let previousHash = "GENESIS";
+  #rebuildIndexes(events) {
+    this.#resetIndexes();
 
-    for (const event of this.events) {
-      const canonical = {
-        eventId: event.eventId,
-        aggregateType: event.aggregateType,
-        aggregateId: event.aggregateId,
-        aggregateVersion: event.aggregateVersion,
-        eventType: event.eventType,
-        occurredAt: event.occurredAt,
-        recordedAt: event.recordedAt,
-        actor: event.actor,
-        payload: event.payload,
-        metadata: {
-          commandId: event.metadata.commandId,
-          correlationId: event.metadata.correlationId,
-          causationId: event.metadata.causationId,
-          previousHash,
-        },
-      };
+    for (const [index, event] of events.entries()) {
+      this.validateEvent(event.eventType, event.payload);
+      this.#indexEvent({ ...event, globalPosition: index + 1 });
+    }
+    this.integrityCache = { ok: true, eventCount: this.events.length, lastHash: this.lastHash };
+    this.integrityDirty = false;
+  }
 
-      const expectedHash = createHash("sha256").update(stableSerialize(canonical)).digest("hex");
-      if (event.metadata.previousHash !== previousHash || event.metadata.hash !== expectedHash) {
-        return {
-          ok: false,
-          eventId: event.eventId,
-          expectedPreviousHash: previousHash,
-          actualPreviousHash: event.metadata.previousHash,
-          expectedHash,
-          actualHash: event.metadata.hash,
-        };
-      }
+  #indexEvent(event) {
+    this.events.push(event);
+    this.eventIndex.set(event.eventId, event);
+    const streamId = `${event.aggregateType}:${event.aggregateId}`;
+    const streamEvents = this.streamIndex.get(streamId) ?? [];
+    streamEvents.push(event);
+    this.streamIndex.set(streamId, streamEvents);
+    this.streamVersions.set(streamId, event.aggregateVersion);
+    if (event.metadata?.commandId) {
+      this.commandIds.add(event.metadata.commandId);
+    }
+    this.lastHash = event.metadata.hash;
+  }
 
-      previousHash = event.metadata.hash;
+  verifyIntegrity({ force = false } = {}) {
+    if (!force && !this.integrityDirty) {
+      return this.integrityCache;
     }
 
-    return { ok: true, eventCount: this.events.length, lastHash: previousHash };
+    const integrity = verifyEventChain(this.events);
+    this.integrityCache = integrity;
+    this.integrityDirty = false;
+    return integrity;
   }
 
   hasCommand(commandId) {
@@ -104,6 +92,22 @@ export class FileEventStore {
 
   getEvents() {
     return [...this.events];
+  }
+
+  getEventsAfter(globalPosition = 0) {
+    return this.events.slice(globalPosition);
+  }
+
+  getLastGlobalPosition() {
+    return this.events.length;
+  }
+
+  getStreamEvents(aggregateType, aggregateId) {
+    return [...(this.streamIndex.get(`${aggregateType}:${aggregateId}`) ?? [])];
+  }
+
+  getEventById(eventId) {
+    return this.eventIndex.get(eventId) ?? null;
   }
 
   append({ aggregateType, aggregateId, expectedVersion, actor, commandId, correlationId, causationId, events }) {
@@ -131,7 +135,7 @@ export class FileEventStore {
 
       const prepared = events.map((entry) => {
         aggregateVersion += 1;
-        const payload = validateEventContract(entry.eventType, entry.payload);
+        const payload = this.validateEvent(entry.eventType, entry.payload);
         const envelope = {
           eventId: randomUUID(),
           aggregateType,
@@ -150,7 +154,7 @@ export class FileEventStore {
           },
         };
 
-        const hash = createHash("sha256").update(stableSerialize(envelope)).digest("hex");
+        const hash = computeEventHash(envelope, previousHash);
         envelope.metadata.hash = hash;
         previousHash = hash;
         return envelope;
@@ -164,14 +168,15 @@ export class FileEventStore {
         await handle.close();
       }
 
-      for (const event of prepared) {
-        this.events.push(event);
-        this.streamVersions.set(streamId, event.aggregateVersion);
-        if (commandId) {
-          this.commandIds.add(commandId);
-        }
-        this.lastHash = event.metadata.hash;
+      const startingGlobalPosition = this.getLastGlobalPosition();
+      for (const [index, event] of prepared.entries()) {
+        this.#indexEvent({
+          ...event,
+          globalPosition: startingGlobalPosition + index + 1,
+        });
       }
+      this.integrityCache = { ok: true, eventCount: this.events.length, lastHash: this.lastHash };
+      this.integrityDirty = false;
 
       return { deduplicated: false, events: prepared, version: aggregateVersion };
     };
