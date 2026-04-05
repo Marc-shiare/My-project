@@ -147,11 +147,14 @@ function renderSummary(snapshot) {
   const entries = [
     ["Claims", snapshot.dashboard.totalClaims],
     ["Awaiting Checker", snapshot.dashboard.awaitingChecker],
+    ["Pending Provider", snapshot.dashboard.pendingProviderSettlements],
+    ["Failed Settlements", snapshot.dashboard.failedSettlements],
     ["Pending Recon", snapshot.dashboard.settledPendingReconciliation],
     ["Reconciled", snapshot.dashboard.reconciledClaims],
     ["Open Exceptions", snapshot.dashboard.openExceptions],
     ["Reserve Booked", money(snapshot.dashboard.reserveTotalMinor)],
     ["Payout Posted", money(snapshot.dashboard.payoutTotalMinor)],
+    ["Payout Reversed", money(snapshot.dashboard.payoutReversalTotalMinor)],
     ["Integrity", snapshot.integrity.ok ? "Verified" : "Failed"],
   ];
 
@@ -182,7 +185,16 @@ function claimActionButtons(claim) {
     buttons.push(`<button class="ghost" data-action="approve" data-claim-id="${claim.claimId}">Approve Settlement</button>`);
   }
   if (claim.status === "SETTLEMENT_APPROVED") {
-    buttons.push(`<button class="ghost" data-action="record" data-claim-id="${claim.claimId}">Record Settlement</button>`);
+    buttons.push(`<button class="ghost" data-action="initiate" data-claim-id="${claim.claimId}">Initiate Settlement</button>`);
+  }
+  if (claim.settlement?.state === "pending_provider") {
+    buttons.push(`<button class="ghost" data-action="refresh" data-claim-id="${claim.claimId}">Refresh Status</button>`);
+  }
+  if (claim.settlement?.state === "failed" && claim.settlement?.failure?.retryable !== false) {
+    buttons.push(`<button class="ghost" data-action="retry" data-claim-id="${claim.claimId}">Retry Settlement</button>`);
+  }
+  if (claim.settlement?.state === "confirmed") {
+    buttons.push(`<button class="ghost" data-action="reverse" data-claim-id="${claim.claimId}">Reverse Settlement</button>`);
   }
   return buttons.join("");
 }
@@ -200,13 +212,14 @@ function renderClaims(snapshot) {
           <header>
             <div>
               <strong>${claim.claimId}</strong>
-              <div class="claim-meta">${claim.policyRef} • ${claim.memberRef} • ${claim.providerRef}</div>
+              <div class="claim-meta"><span>${claim.policyRef}</span><span>${claim.memberRef}</span><span>${claim.providerRef}</span></div>
             </div>
             <span class="pill ${claim.status.includes("EXCEPTION") ? "danger" : claim.status.includes("APPROVED") || claim.status.includes("RECONCILED") ? "ok" : "warn"}">${claim.status}</span>
           </header>
           <p>${claim.narrative}</p>
-          <div class="claim-meta">Claimed: ${money(claim.amountMinor)} • Incident: ${claim.incidentDate}</div>
-          <div class="claim-meta">Settlement Ref: ${claim.settlement?.paymentReference ?? "None"} • Recon: ${claim.reconciliation.status}</div>
+          <div class="claim-meta"><span>Claimed: ${money(claim.amountMinor)}</span><span>Incident: ${claim.incidentDate}</span></div>
+          <div class="claim-meta"><span>Settlement Ref: ${claim.settlement?.paymentReference ?? "None"}</span><span>State: ${claim.settlement?.state ?? "not_started"}</span><span>Provider Ref: ${claim.settlement?.providerReference ?? "n/a"}</span></div>
+          <div class="claim-meta"><span>Matched: ${money(claim.settlement?.matchedAmountMinor ?? 0)}</span><span>Outstanding: ${money(claim.settlement?.outstandingMatchMinor ?? 0)}</span><span>Recon: ${claim.reconciliation.status}</span></div>
           <div class="actions">${claimActionButtons(claim)}</div>
         </article>
       `,
@@ -230,7 +243,7 @@ function renderExceptions(snapshot) {
             <span class="pill danger">${item.exception.code}</span>
           </header>
           <p>${item.exception.reason}</p>
-          <div class="claim-meta">Settlement: ${item.settlementId ?? "n/a"} • Reference: ${item.externalReference ?? "n/a"}</div>
+          <div class="claim-meta"><span>Settlement: ${item.settlementId ?? "n/a"}</span><span>Reference: ${item.externalReference ?? "n/a"}</span></div>
           <div class="actions">
             <button class="ghost" data-action="resolve-exception" data-case-id="${item.caseId}">Resolve</button>
           </div>
@@ -270,7 +283,7 @@ function renderEvents(snapshot) {
             <strong>${event.eventType}</strong>
             <span class="claim-meta">${event.aggregateType}:${event.aggregateId}</span>
           </header>
-          <div class="event-meta">${event.occurredAt} • hash ${event.metadata.hash.slice(0, 12)}...</div>
+          <div class="event-meta"><span>${event.occurredAt}</span><span>hash ${event.metadata.hash.slice(0, 12)}...</span></div>
           <pre>${JSON.stringify(event.payload, null, 2)}</pre>
         </article>
       `,
@@ -373,13 +386,29 @@ async function handleClaimAction(claimId, action) {
       body: { approvalNote: "Checker approval granted from control room." },
       prefix: "approve",
     },
-    record: {
-      url: `/api/claims/${claimId}/record-settlement`,
+    initiate: {
+      url: `/api/claims/${claimId}/initiate-settlement`,
+      body: {},
+      prefix: "initiate",
+    },
+    refresh: {
+      url: `/api/claims/${claimId}/refresh-settlement`,
+      body: {},
+      prefix: "refresh",
+    },
+    retry: {
+      url: `/api/claims/${claimId}/retry-settlement`,
       body: {
-        postingRef: prompt("Posting reference", `POST-${Date.now()}`) ?? `POST-${Date.now()}`,
-        externalStatus: "MANUALLY_CONFIRMED",
+        reason: prompt("Retry reason", "Retry settlement after operational failure.") ?? "Retry settlement after operational failure.",
       },
-      prefix: "record",
+      prefix: "retry",
+    },
+    reverse: {
+      url: `/api/claims/${claimId}/reverse-settlement`,
+      body: {
+        reason: prompt("Reversal reason", "Reverse confirmed settlement after control review.") ?? "Reverse confirmed settlement after control review.",
+      },
+      prefix: "reverse",
     },
   };
 
