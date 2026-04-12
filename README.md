@@ -15,8 +15,9 @@ This repository contains a runnable reference platform for insurance claims, set
 - Runtime event contract validation for claims, approvals, ledger postings, and reconciliation events
 - Read-model projections for dashboard, claims, settlements, ledger, and exceptions
 - A web UI with offline queueing and a service worker
-- Sample self-healing logic that auto-matches only exact low-risk reconciliations
-- Automated tests for governance, immutable postings, idempotency, and self-healing
+- Sample self-healing logic for exact matches, partial payments, duplicate detection, and missing cash movement exceptions
+- Settlement lifecycle controls for float checks, delayed provider confirmation, retry, and reversal
+- Automated tests for governance, immutable postings, idempotency, reconciliation, and simulation flows
 
 ## Run
 
@@ -62,6 +63,7 @@ The platform uses a file-backed event store in [`data/events.jsonl`](data/events
 
 Business and architecture analysis is documented in [docs/architecture.md](docs/architecture.md).
 Phase One ledger foundation details are documented in [docs/phase-1-core-ledger-foundation.md](docs/phase-1-core-ledger-foundation.md).
+Phase Two reconciliation and settlement state-machine details are documented in [docs/phase-2-reconciliation-engine.md](docs/phase-2-reconciliation-engine.md).
 The production Postgres event store schema is documented in [docs/postgres-event-store-schema.sql](docs/postgres-event-store-schema.sql).
 
 ## Storage Modes
@@ -84,6 +86,25 @@ Optional environment variables:
 - `POSTGRES_SSL=require` enables TLS in hosted environments
 
 When `EVENT_STORE_DRIVER=postgres`, install the `pg` package and apply [docs/postgres-event-store-schema.sql](docs/postgres-event-store-schema.sql) before starting the service.
+
+## Settlement Simulation Mode
+
+For local Phase 2 testing, the server can run with the simulated settlement adapter instead of manual immediate confirmation:
+
+```bash
+SETTLEMENT_ADAPTER_MODE=simulated
+SETTLEMENT_SIMULATION_SCENARIOS={"PAY-REF-1":{"mode":"delayed_confirmation","pollsUntilConfirm":1}}
+SETTLEMENT_SIMULATION_FLOATS={"BANK_TRANSFER:KES":500000}
+cmd /c npm start
+```
+
+Supported scenario modes:
+
+- `delayed_confirmation`
+- `duplicate_transaction`
+- `api_failure`
+
+These simulations stay behind the settlement adapter boundary in [src/adapters/ports.mjs](src/adapters/ports.mjs); no external payment API is invented.
 
 ## Demo Personas
 

@@ -16,8 +16,16 @@ import {
   ensureString,
   ensureStringArray,
 } from "../lib/validation.mjs";
+import { SettlementMatchingEngine } from "../reconciliation/settlement-matching-engine.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const SETTLEMENT_FAILURE_CODES = [
+  "API_FAILURE",
+  "DUPLICATE_TRANSACTION",
+  "INSUFFICIENT_FLOAT",
+  "PROVIDER_REJECTED",
+  "PENDING_TIMEOUT",
+];
 
 function money(amountMinor, currency) {
   return {
@@ -40,6 +48,37 @@ function payoutLedgerLines(claimId, amountMinor) {
   ];
 }
 
+function payoutReversalLedgerLines(claimId, amountMinor) {
+  return [
+    { account: "Cash At Bank", debitMinor: amountMinor, creditMinor: 0, reference: claimId },
+    { account: "Claims Reserve", debitMinor: 0, creditMinor: amountMinor, reference: claimId },
+  ];
+}
+
+function settlementConfirmedAmount(settlement) {
+  return settlement.confirmedAmountMinor > 0 ? settlement.confirmedAmountMinor : settlement.amountMinor;
+}
+
+function normalizeStatementLine(line, field) {
+  const value = ensureObject(line, field);
+  return {
+    lineId: ensureOptionalString(value.lineId, `${field}.lineId`, { max: 80 }) ?? createId("line"),
+    externalReference: ensureString(value.externalReference, `${field}.externalReference`, { max: 120 }),
+    narrative: ensureString(value.narrative ?? value.externalReference, `${field}.narrative`, { max: 240 }),
+    amountMinor: ensureInteger(value.amountMinor, `${field}.amountMinor`, { min: 0 }),
+    currency: ensureCurrency(value.currency ?? "KES"),
+    direction: ensureEnum(value.direction, `${field}.direction`, ["DEBIT", "CREDIT"]),
+    valueDate: ensureIsoDate(value.valueDate, `${field}.valueDate`),
+    channelType: ensureEnum(value.channelType ?? "UNKNOWN", `${field}.channelType`, [
+      "BANK_TRANSFER",
+      "MOBILE_MONEY",
+      "CARD_REVERSAL",
+      "CHEQUE",
+      "UNKNOWN",
+    ]),
+  };
+}
+
 export class ClaimsPlatform {
   constructor({
     eventStore,
@@ -48,6 +87,7 @@ export class ClaimsPlatform {
     checkpointStore = null,
     projectionName = "claims-platform",
     checkpointEvery = 100,
+    matchingEngine = new SettlementMatchingEngine(),
   }) {
     this.eventStore = eventStore;
     this.projections = projections;
@@ -56,6 +96,7 @@ export class ClaimsPlatform {
     this.projectionName = projectionName;
     this.checkpointEvery = checkpointEvery;
     this.lastCheckpointPosition = 0;
+    this.matchingEngine = matchingEngine;
   }
 
   async init() {
@@ -70,6 +111,7 @@ export class ClaimsPlatform {
     }
 
     this.projections.rebuild(this.eventStore.getEvents(), integrity);
+    this.lastCheckpointPosition = this.#getLastGlobalPosition();
   }
 
   getSnapshot() {
@@ -206,7 +248,7 @@ export class ClaimsPlatform {
     if (!claim.adjudication || !["APPROVED", "PARTIALLY_APPROVED"].includes(claim.adjudication.decision)) {
       throw new ConflictError("Claim must be approved before settlement can be proposed.");
     }
-    if (claim.settlement) {
+    if (claim.settlement && claim.settlement.state !== "reversed") {
       throw new ConflictError("Settlement is already present for this claim.");
     }
 
@@ -303,13 +345,11 @@ export class ClaimsPlatform {
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
   }
 
-  async recordSettlement(claimId, command) {
+  async initiateSettlement(claimId, command) {
     const claim = this.#requireClaim(claimId);
     const actor = await this.#resolveActor(command.actor);
     ensureHasRole(actor, ["FINANCE_CHECKER"]);
-    if (!claim.settlement || claim.settlement.status !== "APPROVED") {
-      throw new ConflictError("Settlement must be approved before recording.");
-    }
+    this.#requireApprovedSettlement(claim);
 
     const commandId = ensureCommandId(command.commandId);
     if (this.projections.hasCommand(commandId)) {
@@ -317,6 +357,157 @@ export class ClaimsPlatform {
     }
 
     const body = ensureObject(command.body ?? {}, "body");
+    const attemptId = ensureOptionalString(body.attemptId, "attemptId", { max: 80 }) ?? createId("stla");
+    const attemptNumber = (claim.settlement.attemptCount ?? 0) + 1;
+    const events = await this.#buildDispatchAttemptEvents({
+      claim,
+      actor,
+      attemptId,
+      attemptNumber,
+    });
+
+    const result = await this.eventStore.append({
+      aggregateType: "claim",
+      aggregateId: claimId,
+      expectedVersion: claim.version,
+      actor,
+      commandId,
+      correlationId: claimId,
+      events,
+    });
+    await this.#applyAndCheckpoint(result.events);
+    return { claim: this.projections.getClaim(claimId), deduplicated: false };
+  }
+
+  async recordSettlement(claimId, command) {
+    return this.initiateSettlement(claimId, command);
+  }
+
+  async refreshSettlement(claimId, command) {
+    const claim = this.#requireClaim(claimId);
+    const actor = await this.#resolveActor(command.actor);
+    ensureHasRole(actor, ["FINANCE_CHECKER", "SYSTEM"]);
+    this.#requirePendingSettlement(claim);
+
+    const commandId = ensureCommandId(command.commandId);
+    if (this.projections.hasCommand(commandId)) {
+      return { claim: this.projections.getClaim(claimId), deduplicated: true };
+    }
+
+    let outcome;
+    try {
+      outcome = await this.adapters.settlementChannelPort.pollSettlement({
+        settlementId: claim.settlement.settlementId,
+        attemptId: claim.settlement.lastAttemptId,
+        providerReference: claim.settlement.providerReference,
+        paymentReference: claim.settlement.paymentReference,
+        amountMinor: claim.settlement.amountMinor,
+        currency: claim.currency,
+        channelType: claim.settlement.channelType,
+      });
+    } catch (error) {
+      outcome = {
+        providerStatus: "pending_provider",
+        providerReference: claim.settlement.providerReference ?? claim.settlement.paymentReference,
+        reason: `Settlement status refresh failed: ${error.message}`,
+        nextReviewAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      };
+    }
+
+    const events = this.#buildSettlementOutcomeEvents({
+      claim,
+      attemptId: claim.settlement.lastAttemptId,
+      attemptNumber: claim.settlement.attemptCount ?? 1,
+      outcome,
+    });
+
+    const result = await this.eventStore.append({
+      aggregateType: "claim",
+      aggregateId: claimId,
+      expectedVersion: claim.version,
+      actor,
+      commandId,
+      correlationId: claimId,
+      events,
+    });
+    await this.#applyAndCheckpoint(result.events);
+    return { claim: this.projections.getClaim(claimId), deduplicated: false };
+  }
+
+  async retrySettlement(claimId, command) {
+    const claim = this.#requireClaim(claimId);
+    const actor = await this.#resolveActor(command.actor);
+    ensureHasRole(actor, ["FINANCE_CHECKER"]);
+    this.#requireFailedSettlement(claim);
+
+    const commandId = ensureCommandId(command.commandId);
+    if (this.projections.hasCommand(commandId)) {
+      return { claim: this.projections.getClaim(claimId), deduplicated: true };
+    }
+
+    const body = ensureObject(command.body ?? {}, "body");
+    const attemptId = ensureOptionalString(body.attemptId, "attemptId", { max: 80 }) ?? createId("stla");
+    const attemptNumber = (claim.settlement.attemptCount ?? 0) + 1;
+    const retryReason = ensureString(body.reason ?? "Retry requested after operational failure.", "reason", { max: 240 });
+    const events = [
+      {
+        eventType: "SettlementRetried",
+        payload: {
+          settlementId: claim.settlement.settlementId,
+          previousAttemptNumber: Math.max(claim.settlement.attemptCount ?? 1, 1),
+          nextAttemptNumber: attemptNumber,
+          reason: retryReason,
+        },
+      },
+      ...(await this.#buildDispatchAttemptEvents({
+        claim,
+        actor,
+        attemptId,
+        attemptNumber,
+      })),
+    ];
+
+    const result = await this.eventStore.append({
+      aggregateType: "claim",
+      aggregateId: claimId,
+      expectedVersion: claim.version,
+      actor,
+      commandId,
+      correlationId: claimId,
+      events,
+    });
+    await this.#applyAndCheckpoint(result.events);
+    return { claim: this.projections.getClaim(claimId), deduplicated: false };
+  }
+
+  async reverseSettlement(claimId, command) {
+    const claim = this.#requireClaim(claimId);
+    const actor = await this.#resolveActor(command.actor);
+    ensureHasRole(actor, ["FINANCE_CHECKER"]);
+    this.#requireConfirmedSettlement(claim);
+
+    const commandId = ensureCommandId(command.commandId);
+    if (this.projections.hasCommand(commandId)) {
+      return { claim: this.projections.getClaim(claimId), deduplicated: true };
+    }
+
+    const body = ensureObject(command.body ?? {}, "body");
+    const reason = ensureString(body.reason, "reason", { max: 240 });
+    const reversal = await this.adapters.settlementChannelPort.reverseSettlement({
+      settlementId: claim.settlement.settlementId,
+      paymentReference: claim.settlement.paymentReference,
+      providerReference: claim.settlement.providerReference,
+      amountMinor: settlementConfirmedAmount(claim.settlement),
+      currency: claim.currency,
+      channelType: claim.settlement.channelType,
+    });
+
+    const reversedAmountMinor = ensureInteger(
+      reversal.reversedAmountMinor ?? settlementConfirmedAmount(claim.settlement),
+      "reversedAmountMinor",
+      { min: 1, max: settlementConfirmedAmount(claim.settlement) },
+    );
+
     const result = await this.eventStore.append({
       aggregateType: "claim",
       aggregateId: claimId,
@@ -326,31 +517,97 @@ export class ClaimsPlatform {
       correlationId: claimId,
       events: [
         {
-          eventType: "SettlementRecorded",
+          eventType: "SettlementReversed",
           payload: {
             settlementId: claim.settlement.settlementId,
-            postingRef: ensureString(body.postingRef, "postingRef", { max: 120 }),
-            amountMinor: claim.settlement.amountMinor,
+            reversalId: ensureOptionalString(body.reversalId, "reversalId", { max: 80 }) ?? createId("reversal"),
+            providerReference: reversal.providerReference ?? claim.settlement.providerReference,
+            reversedAmountMinor,
             currency: claim.currency,
-            channelType: claim.settlement.channelType,
-            externalStatus: ensureEnum(body.externalStatus ?? "MANUALLY_CONFIRMED", "externalStatus", [
-              "MANUALLY_CONFIRMED",
-              "POSTED_FROM_ADAPTER",
-            ]),
+            reason,
+            reversedAt: reversal.reversedAt ?? new Date().toISOString(),
           },
         },
         {
           eventType: "LedgerEntryPosted",
           payload: {
-            entryType: "CLAIM_PAYOUT",
+            entryType: "CLAIM_PAYOUT_REVERSAL",
             currency: claim.currency,
-            lines: payoutLedgerLines(claimId, claim.settlement.amountMinor),
+            lines: payoutReversalLedgerLines(claimId, reversedAmountMinor),
           },
         },
       ],
     });
     await this.#applyAndCheckpoint(result.events);
     return { claim: this.projections.getClaim(claimId), deduplicated: false };
+  }
+
+  async refreshPendingSettlements(command) {
+    const actor = await this.#resolveActor(command.actor);
+    ensureHasRole(actor, ["FINANCE_CHECKER", "SYSTEM"]);
+
+    let confirmed = 0;
+    let stillPending = 0;
+    let failed = 0;
+
+    const claims = this.projections
+      .listClaims()
+      .filter((claim) => claim.settlement && claim.settlement.state === "pending_provider");
+
+    for (const claim of claims) {
+      let outcome;
+      try {
+        outcome = await this.adapters.settlementChannelPort.pollSettlement({
+          settlementId: claim.settlement.settlementId,
+          attemptId: claim.settlement.lastAttemptId,
+          providerReference: claim.settlement.providerReference,
+          paymentReference: claim.settlement.paymentReference,
+          amountMinor: claim.settlement.amountMinor,
+          currency: claim.currency,
+          channelType: claim.settlement.channelType,
+        });
+      } catch (error) {
+        outcome = {
+          providerStatus: "pending_provider",
+          providerReference: claim.settlement.providerReference ?? claim.settlement.paymentReference,
+          reason: `Settlement status refresh failed: ${error.message}`,
+          nextReviewAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+        };
+      }
+
+      const events = this.#buildSettlementOutcomeEvents({
+        claim,
+        attemptId: claim.settlement.lastAttemptId,
+        attemptNumber: claim.settlement.attemptCount ?? 1,
+        outcome,
+      });
+
+      const result = await this.eventStore.append({
+        aggregateType: "claim",
+        aggregateId: claim.claimId,
+        expectedVersion: claim.version,
+        actor,
+        commandId: undefined,
+        correlationId: claim.claimId,
+        events,
+      });
+      await this.#applyAndCheckpoint(result.events);
+
+      if (outcome.providerStatus === "confirmed") {
+        confirmed += 1;
+      } else if (outcome.providerStatus === "pending_provider") {
+        stillPending += 1;
+      } else {
+        failed += 1;
+      }
+    }
+
+    return {
+      confirmed,
+      stillPending,
+      failed,
+      processedAt: new Date().toISOString(),
+    };
   }
 
   async importReconciliationBatch(command) {
@@ -366,28 +623,13 @@ export class ClaimsPlatform {
       throw new ValidationError("body.lines must be a non-empty array.");
     }
 
-    const normalizedLines = await this.adapters.statementImportPort.ingestBatch(
-      body.lines.map((line, index) => {
-        const value = ensureObject(line, `lines[${index}]`);
-        return {
-          lineId: ensureOptionalString(value.lineId, `lines[${index}].lineId`, { max: 80 }) ?? createId("line"),
-          externalReference: ensureString(value.externalReference, `lines[${index}].externalReference`, { max: 120 }),
-          narrative: ensureString(value.narrative ?? value.externalReference, `lines[${index}].narrative`, { max: 240 }),
-          amountMinor: ensureInteger(value.amountMinor, `lines[${index}].amountMinor`, { min: 0 }),
-          currency: ensureCurrency(value.currency ?? "KES"),
-          direction: ensureEnum(value.direction, `lines[${index}].direction`, ["DEBIT", "CREDIT"]),
-          valueDate: ensureIsoDate(value.valueDate, `lines[${index}].valueDate`),
-          channelType: ensureEnum(value.channelType ?? "UNKNOWN", `lines[${index}].channelType`, [
-            "BANK_TRANSFER",
-            "MOBILE_MONEY",
-            "CARD_REVERSAL",
-            "CHEQUE",
-            "UNKNOWN",
-          ]),
-        };
-      }),
-    );
+    const requestedLines = body.lines.map((line, index) => normalizeStatementLine(line, `lines[${index}]`));
+    const importedLines = await this.adapters.statementImportPort.ingestBatch(requestedLines);
+    if (!Array.isArray(importedLines) || importedLines.length === 0) {
+      throw new ValidationError("Imported statement lines must be a non-empty array.");
+    }
 
+    const normalizedLines = importedLines.map((line, index) => normalizeStatementLine(line, `importedLines[${index}]`));
     const batchId = createId("rcb");
     const digest = createHash("sha256").update(stableSerialize(normalizedLines)).digest("hex");
     const batchResult = await this.eventStore.append({
@@ -452,7 +694,7 @@ export class ClaimsPlatform {
     ensureHasRole(actor, ["RECON_ANALYST", "SYSTEM"]);
     const commandId = ensureCommandId(command.commandId);
     if (this.projections.hasCommand(commandId)) {
-      return { deduplicated: true, summary: this.#buildSelfHealSummary(0, 0) };
+      return { deduplicated: true, summary: this.#buildSelfHealSummary(0, 0, 0) };
     }
 
     const body = ensureObject(command.body ?? {}, "body");
@@ -463,101 +705,91 @@ export class ClaimsPlatform {
     }
 
     let autoMatches = 0;
+    let partialMatches = 0;
     let exceptionsOpened = 0;
-    const openCases = this.projections.listCases().filter((item) => item.status === "OPEN" && item.lineId);
-    const claims = this.projections.listClaims();
+
+    const allLineCases = this.projections.listCases().filter((item) => item.lineId);
+    const duplicateCaseIds = this.matchingEngine.findDuplicateCaseIds(allLineCases);
+    const openCases = allLineCases
+      .filter((item) => item.status === "OPEN")
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+    let claims = this.projections.listClaims();
 
     for (const item of openCases) {
-      if (item.direction !== "DEBIT") {
+      const evaluation = this.matchingEngine.evaluateCase(item, claims, duplicateCaseIds);
+      if (evaluation.outcome === "ignore") {
         continue;
       }
 
-      const candidates = claims.filter((claim) => {
-        const settlement = claim.settlement;
-        return (
-          settlement &&
-          ["APPROVED", "RECORDED"].includes(settlement.status) &&
-          settlement.amountMinor === item.amountMinor &&
-          claim.currency === item.currency &&
-          !settlement.matchedCaseId
-        );
-      });
-
-      const exact = candidates.filter((claim) => claim.settlement.paymentReference === item.externalReference);
-      if (exact.length === 1) {
-        const winner = exact[0];
-        const result = await this.eventStore.append({
-          aggregateType: "reconciliation_case",
-          aggregateId: item.caseId,
-          expectedVersion: item.version,
-          actor,
-          commandId: undefined,
-          correlationId: item.caseId,
-          causationId: commandId,
-          events: [
-            {
-              eventType: "MatchCandidateGenerated",
-              payload: {
-                caseId: item.caseId,
-                claimId: winner.claimId,
-                settlementId: winner.settlement.settlementId,
-                matchType: "EXACT_REFERENCE_AMOUNT",
-                confidence: 1,
-              },
+      let events;
+      if (evaluation.outcome === "full_match") {
+        events = [
+          {
+            eventType: "MatchCandidateGenerated",
+            payload: {
+              caseId: item.caseId,
+              claimId: evaluation.claimId,
+              settlementId: evaluation.settlementId,
+              matchType: evaluation.matchType,
+              confidence: evaluation.confidence,
             },
-            {
-              eventType: "AutoMatchApplied",
-              payload: {
-                caseId: item.caseId,
-                claimId: winner.claimId,
-                settlementId: winner.settlement.settlementId,
-                reason: "Exact payment reference, currency, and amount matched.",
-              },
+          },
+          {
+            eventType: "AutoMatchApplied",
+            payload: {
+              caseId: item.caseId,
+              claimId: evaluation.claimId,
+              settlementId: evaluation.settlementId,
+              matchedAmountMinor: evaluation.matchedAmountMinor,
+              reason: evaluation.reason,
             },
-          ],
-        });
-        await this.#applyAndCheckpoint(result.events);
+          },
+        ];
         autoMatches += 1;
-        continue;
-      }
-
-      const amountOnly = candidates.filter((claim) => claim.settlement.paymentReference !== item.externalReference);
-      if (amountOnly.length === 1) {
-        const winner = amountOnly[0];
-        const result = await this.eventStore.append({
-          aggregateType: "reconciliation_case",
-          aggregateId: item.caseId,
-          expectedVersion: item.version,
-          actor,
-          commandId: undefined,
-          correlationId: item.caseId,
-          causationId: commandId,
-          events: [
-            {
-              eventType: "ReconciliationExceptionOpened",
-              payload: {
-                caseId: item.caseId,
-                batchId: item.batchId,
-                lineId: item.lineId,
-                claimId: winner.claimId,
-                settlementId: winner.settlement.settlementId,
-                code: "REFERENCE_MISMATCH",
-                severity: "MEDIUM",
-                reason: "Amount matched a single payout, but the external reference did not.",
-              },
+      } else if (evaluation.outcome === "partial_match") {
+        events = [
+          {
+            eventType: "MatchCandidateGenerated",
+            payload: {
+              caseId: item.caseId,
+              claimId: evaluation.claimId,
+              settlementId: evaluation.settlementId,
+              matchType: evaluation.matchType,
+              confidence: evaluation.confidence,
             },
-          ],
-        });
-        await this.#applyAndCheckpoint(result.events);
+          },
+          {
+            eventType: "PartialMatchApplied",
+            payload: {
+              caseId: item.caseId,
+              claimId: evaluation.claimId,
+              settlementId: evaluation.settlementId,
+              matchedAmountMinor: evaluation.matchedAmountMinor,
+              cumulativeMatchedAmountMinor: evaluation.cumulativeMatchedAmountMinor,
+              remainingAmountMinor: evaluation.remainingAmountMinor,
+              reason: evaluation.reason,
+            },
+          },
+        ];
+        partialMatches += 1;
+      } else {
+        events = [
+          {
+            eventType: "ReconciliationExceptionOpened",
+            payload: {
+              caseId: item.caseId,
+              batchId: item.batchId,
+              lineId: item.lineId,
+              claimId: evaluation.claimId ?? null,
+              settlementId: evaluation.settlementId ?? null,
+              code: evaluation.code,
+              severity: evaluation.severity,
+              reason: evaluation.reason,
+            },
+          },
+        ];
         exceptionsOpened += 1;
-        continue;
       }
-
-      const code = amountOnly.length > 1 ? "AMBIGUOUS_MATCH" : "UNLINKED_CASHFLOW";
-      const reason =
-        code === "AMBIGUOUS_MATCH"
-          ? "Multiple candidate payouts share the same amount. Manual review is required."
-          : "No approved or recorded payout matched this statement line.";
 
       const result = await this.eventStore.append({
         aggregateType: "reconciliation_case",
@@ -567,46 +799,23 @@ export class ClaimsPlatform {
         commandId: undefined,
         correlationId: item.caseId,
         causationId: commandId,
-        events: [
-          {
-            eventType: "ReconciliationExceptionOpened",
-            payload: {
-              caseId: item.caseId,
-              batchId: item.batchId,
-              lineId: item.lineId,
-              claimId: null,
-              settlementId: null,
-              code,
-              severity: code === "AMBIGUOUS_MATCH" ? "HIGH" : "MEDIUM",
-              reason,
-            },
-          },
-        ],
+        events,
       });
       await this.#applyAndCheckpoint(result.events);
-      exceptionsOpened += 1;
+      claims = this.projections.listClaims();
     }
 
-    const refreshedClaims = this.projections.listClaims();
-    for (const claim of refreshedClaims) {
-      if (!claim.settlement || !["APPROVED", "RECORDED"].includes(claim.settlement.status) || claim.settlement.matchedCaseId) {
-        continue;
-      }
+    const missingCashMovementClaims = this.matchingEngine.findMissingCashMovementClaims(
+      this.projections.listClaims(),
+      this.projections.listCases(),
+      now,
+      maxAgeDays,
+    );
 
-      const anchor = claim.settlement.recordedAt ?? claim.settlement.approvedAt ?? claim.updatedAt;
-      const ageDays = Math.floor((now.getTime() - new Date(anchor).getTime()) / DAY_MS);
-      if (ageDays < maxAgeDays) {
-        continue;
-      }
-
+    for (const claim of missingCashMovementClaims) {
       const existingCase = this.projections
         .listCases()
-        .find(
-          (item) =>
-            item.settlementId === claim.settlement.settlementId &&
-            item.exception?.code === "MISSING_CASH_MOVEMENT" &&
-            item.status === "EXCEPTION",
-        );
+        .find((item) => item.settlementId === claim.settlement.settlementId && item.exception?.code === "MISSING_CASH_MOVEMENT");
       if (existingCase) {
         continue;
       }
@@ -631,7 +840,7 @@ export class ClaimsPlatform {
               settlementId: claim.settlement.settlementId,
               code: "MISSING_CASH_MOVEMENT",
               severity: "HIGH",
-              reason: `No cash movement has been imported within ${maxAgeDays} days of payout approval/recording.`,
+              reason: `No cash movement has been imported within ${maxAgeDays} days of settlement confirmation.`,
             },
           },
         ],
@@ -640,7 +849,10 @@ export class ClaimsPlatform {
       exceptionsOpened += 1;
     }
 
-    return { deduplicated: false, summary: this.#buildSelfHealSummary(autoMatches, exceptionsOpened) };
+    return {
+      deduplicated: false,
+      summary: this.#buildSelfHealSummary(autoMatches, partialMatches, exceptionsOpened),
+    };
   }
 
   async resolveException(caseId, command) {
@@ -745,10 +957,10 @@ export class ClaimsPlatform {
       commandId: "demo-approve-1",
       body: { approvalNote: "Verified supporting documents and beneficiary reference." },
     });
-    await this.recordSettlement(claimOne.claim.claimId, {
+    await this.initiateSettlement(claimOne.claim.claimId, {
       actor: roles.financeChecker,
-      commandId: "demo-record-1",
-      body: { postingRef: "BANKPOST-001", externalStatus: "MANUALLY_CONFIRMED" },
+      commandId: "demo-initiate-1",
+      body: {},
     });
 
     const claimTwo = await this.submitClaim({
@@ -792,10 +1004,10 @@ export class ClaimsPlatform {
       commandId: "demo-approve-2",
       body: { approvalNote: "Beneficiary mobile reference verified." },
     });
-    await this.recordSettlement(claimTwo.claim.claimId, {
+    await this.initiateSettlement(claimTwo.claim.claimId, {
       actor: roles.financeChecker,
-      commandId: "demo-record-2",
-      body: { postingRef: "MMP-002", externalStatus: "MANUALLY_CONFIRMED" },
+      commandId: "demo-initiate-2",
+      body: {},
     });
 
     await this.importReconciliationBatch({
@@ -816,9 +1028,18 @@ export class ClaimsPlatform {
             channelType: "BANK_TRANSFER",
           },
           {
+            externalReference: "PAY-KE-0002",
+            narrative: "Provider mobile settlement partial one",
+            amountMinor: 100000,
+            currency: "KES",
+            direction: "DEBIT",
+            valueDate: "2026-04-03",
+            channelType: "MOBILE_MONEY",
+          },
+          {
             externalReference: "PAY-KE-0002X",
-            narrative: "Provider mobile settlement",
-            amountMinor: 180000,
+            narrative: "Provider mobile settlement duplicate mismatch",
+            amountMinor: 100000,
             currency: "KES",
             direction: "DEBIT",
             valueDate: "2026-04-03",
@@ -854,9 +1075,207 @@ export class ClaimsPlatform {
     return claim;
   }
 
-  #buildSelfHealSummary(autoMatches, exceptionsOpened) {
+  #requireApprovedSettlement(claim) {
+    if (!claim.settlement || claim.settlement.workflowStatus !== "APPROVED") {
+      throw new ConflictError("Settlement must be approved before initiation.");
+    }
+    if (claim.settlement.state && !["failed"].includes(claim.settlement.state)) {
+      throw new ConflictError("Settlement is already in progress or completed.");
+    }
+  }
+
+  #requirePendingSettlement(claim) {
+    if (!claim.settlement || claim.settlement.state !== "pending_provider") {
+      throw new ConflictError("Settlement must be awaiting provider confirmation before refresh.");
+    }
+  }
+
+  #requireFailedSettlement(claim) {
+    if (!claim.settlement || claim.settlement.state !== "failed") {
+      throw new ConflictError("Only failed settlements can be retried.");
+    }
+    if (claim.settlement.failure && claim.settlement.failure.retryable === false) {
+      throw new ConflictError("This settlement failure is marked as non-retryable and requires manual investigation.");
+    }
+  }
+
+  #requireConfirmedSettlement(claim) {
+    if (!claim.settlement || claim.settlement.state !== "confirmed") {
+      throw new ConflictError("Only confirmed settlements can be reversed.");
+    }
+  }
+
+  async #buildDispatchAttemptEvents({ claim, actor, attemptId, attemptNumber }) {
+    let floatAvailability;
+    try {
+      floatAvailability = await this.adapters.settlementChannelPort.checkFloatAvailability({
+        channelType: claim.settlement.channelType,
+        currency: claim.currency,
+      });
+    } catch (error) {
+      return [
+        {
+          eventType: "SettlementFailed",
+          payload: {
+            settlementId: claim.settlement.settlementId,
+            attemptId,
+            attemptNumber,
+            failureCode: "API_FAILURE",
+            retryable: true,
+            reason: `Float availability check failed: ${error.message}`,
+          },
+        },
+      ];
+    }
+
+    const floatAccountRef = ensureString(floatAvailability.floatAccountRef, "floatAccountRef", { max: 160 });
+    const availableFloatMinor = ensureInteger(floatAvailability.availableFloatMinor, "availableFloatMinor", { min: 0 });
+
+    if (availableFloatMinor < claim.settlement.amountMinor) {
+      return [
+        {
+          eventType: "SettlementFailed",
+          payload: {
+            settlementId: claim.settlement.settlementId,
+            attemptId,
+            attemptNumber,
+            failureCode: "INSUFFICIENT_FLOAT",
+            retryable: true,
+            reason: `Available float ${availableFloatMinor} is below required settlement amount ${claim.settlement.amountMinor}.`,
+            availableFloatMinor,
+          },
+        },
+      ];
+    }
+
+    const events = [
+      {
+        eventType: "SettlementInitiated",
+        payload: {
+          settlementId: claim.settlement.settlementId,
+          attemptId,
+          attemptNumber,
+          channelType: claim.settlement.channelType,
+          beneficiaryRef: claim.settlement.beneficiaryRef,
+          paymentReference: claim.settlement.paymentReference,
+          amountMinor: claim.settlement.amountMinor,
+          currency: claim.currency,
+          floatAccountRef,
+          availableFloatMinor,
+          initiatedByActorId: actor.actorId,
+        },
+      },
+    ];
+
+    let outcome;
+    try {
+      outcome = await this.adapters.settlementChannelPort.initiateSettlement({
+        settlementId: claim.settlement.settlementId,
+        attemptId,
+        attemptNumber,
+        beneficiaryRef: claim.settlement.beneficiaryRef,
+        paymentReference: claim.settlement.paymentReference,
+        amountMinor: claim.settlement.amountMinor,
+        currency: claim.currency,
+        channelType: claim.settlement.channelType,
+      });
+    } catch (error) {
+      outcome = {
+        providerStatus: "failed",
+        failureCode: "API_FAILURE",
+        retryable: true,
+        reason: error.message,
+        availableFloatMinor,
+      };
+    }
+
+    return [...events, ...this.#buildSettlementOutcomeEvents({ claim, attemptId, attemptNumber, outcome })];
+  }
+
+  #buildSettlementOutcomeEvents({ claim, attemptId, attemptNumber, outcome }) {
+    const settlementId = claim.settlement.settlementId;
+    switch (outcome.providerStatus) {
+      case "pending_provider":
+        return [
+          {
+            eventType: "SettlementPendingProvider",
+            payload: {
+              settlementId,
+              attemptId,
+              providerReference: ensureString(
+                outcome.providerReference ?? claim.settlement.providerReference ?? claim.settlement.paymentReference,
+                "providerReference",
+                { max: 120 },
+              ),
+              reason: ensureString(outcome.reason ?? "Awaiting provider confirmation.", "reason", { max: 240 }),
+              nextReviewAt: ensureOptionalString(outcome.nextReviewAt, "nextReviewAt", { max: 40 }),
+            },
+          },
+        ];
+      case "confirmed": {
+        const confirmedAmountMinor = ensureInteger(
+          outcome.confirmedAmountMinor ?? claim.settlement.amountMinor,
+          "confirmedAmountMinor",
+          { min: 1, max: claim.settlement.amountMinor },
+        );
+        return [
+          {
+            eventType: "SettlementConfirmed",
+            payload: {
+              settlementId,
+              attemptId,
+              providerReference: ensureString(
+                outcome.providerReference ?? claim.settlement.providerReference ?? claim.settlement.paymentReference,
+                "providerReference",
+                { max: 120 },
+              ),
+              confirmedAmountMinor,
+              currency: claim.currency,
+              providerConfirmedAt: outcome.providerConfirmedAt ?? new Date().toISOString(),
+              externalStatus: ensureEnum(
+                outcome.externalStatus ?? "POSTED_FROM_ADAPTER",
+                "externalStatus",
+                ["MANUALLY_CONFIRMED", "POSTED_FROM_ADAPTER", "SIMULATED_CONFIRMATION"],
+              ),
+            },
+          },
+          {
+            eventType: "LedgerEntryPosted",
+            payload: {
+              entryType: "CLAIM_PAYOUT",
+              currency: claim.currency,
+              lines: payoutLedgerLines(claim.claimId, confirmedAmountMinor),
+            },
+          },
+        ];
+      }
+      default: {
+        const failureCode = ensureEnum(outcome.failureCode ?? "PROVIDER_REJECTED", "failureCode", SETTLEMENT_FAILURE_CODES);
+        return [
+          {
+            eventType: "SettlementFailed",
+            payload: {
+              settlementId,
+              attemptId,
+              attemptNumber,
+              failureCode,
+              retryable:
+                typeof outcome.retryable === "boolean"
+                  ? outcome.retryable
+                  : !["DUPLICATE_TRANSACTION", "PROVIDER_REJECTED"].includes(failureCode),
+              reason: ensureString(outcome.reason ?? "Settlement failed at the provider boundary.", "reason", { max: 240 }),
+              availableFloatMinor: Number.isInteger(outcome.availableFloatMinor) ? outcome.availableFloatMinor : undefined,
+            },
+          },
+        ];
+      }
+    }
+  }
+
+  #buildSelfHealSummary(autoMatches, partialMatches, exceptionsOpened) {
     return {
       autoMatches,
+      partialMatches,
       exceptionsOpened,
       generatedAt: new Date().toISOString(),
     };

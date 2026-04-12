@@ -74,6 +74,13 @@ export function ensureNumber(value, field, options = {}) {
   return value;
 }
 
+export function ensureBoolean(value, field) {
+  if (typeof value !== "boolean") {
+    fail(field, "must be a boolean");
+  }
+  return value;
+}
+
 export function ensureArray(value, field, itemValidator = (item) => item) {
   if (!Array.isArray(value)) {
     fail(field, "must be an array");
@@ -100,6 +107,15 @@ export function ensureIsoDate(value, field) {
     fail(field, "must be a valid ISO date");
   }
   return normalized;
+}
+
+export function ensureIsoTimestamp(value, field) {
+  const normalized = ensureString(value, field, { min: 20, max: 40 });
+  const timestamp = new Date(normalized);
+  if (Number.isNaN(timestamp.getTime())) {
+    fail(field, "must be a valid ISO timestamp");
+  }
+  return timestamp.toISOString();
 }
 
 export function ensureStringArray(value, field) {

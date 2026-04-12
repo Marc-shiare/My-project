@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createManualAdapters, createSimulatedAdapters } from "./adapters/ports.mjs";
 import { ClaimsPlatform } from "./application/platform.mjs";
 import { createEventInfrastructure } from "./infrastructure/event-store-factory.mjs";
 import { ProjectionStore } from "./infrastructure/projection-store.mjs";
@@ -16,6 +17,21 @@ const dataFile = path.join(rootDir, "data", "events.jsonl");
 const checkpointFile = path.join(rootDir, "data", "projection-checkpoints.json");
 const port = Number(process.env.PORT ?? 3000);
 
+function parseJsonEnv(name, fallback) {
+  if (!process.env[name]) {
+    return fallback;
+  }
+  return JSON.parse(process.env[name]);
+}
+
+const adapters =
+  (process.env.SETTLEMENT_ADAPTER_MODE ?? "manual") === "simulated"
+    ? createSimulatedAdapters({
+        settlementScenarios: parseJsonEnv("SETTLEMENT_SIMULATION_SCENARIOS", {}),
+        floatBalances: parseJsonEnv("SETTLEMENT_SIMULATION_FLOATS", {}),
+      })
+    : createManualAdapters();
+
 const infrastructure = await createEventInfrastructure({
   dataFile,
   checkpointFile,
@@ -24,6 +40,7 @@ const infrastructure = await createEventInfrastructure({
 const platform = new ClaimsPlatform({
   eventStore: infrastructure.eventStore,
   projections: new ProjectionStore(),
+  adapters,
   checkpointStore: infrastructure.checkpointStore,
 });
 
@@ -133,6 +150,40 @@ async function routeApi(request, response, pathname) {
   if (request.method === "POST" && recordMatch) {
     const body = await readJsonBody(request);
     sendJson(response, 200, await platform.recordSettlement(decodeURIComponent(recordMatch[1]), body));
+    return;
+  }
+
+  const initiateMatch = pathname.match(/^\/api\/claims\/([^/]+)\/initiate-settlement$/);
+  if (request.method === "POST" && initiateMatch) {
+    const body = await readJsonBody(request);
+    sendJson(response, 200, await platform.initiateSettlement(decodeURIComponent(initiateMatch[1]), body));
+    return;
+  }
+
+  const refreshSettlementMatch = pathname.match(/^\/api\/claims\/([^/]+)\/refresh-settlement$/);
+  if (request.method === "POST" && refreshSettlementMatch) {
+    const body = await readJsonBody(request);
+    sendJson(response, 200, await platform.refreshSettlement(decodeURIComponent(refreshSettlementMatch[1]), body));
+    return;
+  }
+
+  const retrySettlementMatch = pathname.match(/^\/api\/claims\/([^/]+)\/retry-settlement$/);
+  if (request.method === "POST" && retrySettlementMatch) {
+    const body = await readJsonBody(request);
+    sendJson(response, 200, await platform.retrySettlement(decodeURIComponent(retrySettlementMatch[1]), body));
+    return;
+  }
+
+  const reverseSettlementMatch = pathname.match(/^\/api\/claims\/([^/]+)\/reverse-settlement$/);
+  if (request.method === "POST" && reverseSettlementMatch) {
+    const body = await readJsonBody(request);
+    sendJson(response, 200, await platform.reverseSettlement(decodeURIComponent(reverseSettlementMatch[1]), body));
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/settlements/refresh-pending") {
+    const body = await readJsonBody(request);
+    sendJson(response, 200, await platform.refreshPendingSettlements(body));
     return;
   }
 

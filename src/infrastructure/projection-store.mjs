@@ -4,6 +4,20 @@ function byNewest(a, b) {
   return b.updatedAt.localeCompare(a.updatedAt);
 }
 
+function settlementTargetAmount(settlement) {
+  return settlement.confirmedAmountMinor > 0 ? settlement.confirmedAmountMinor : settlement.amountMinor;
+}
+
+function settlementRemainingAmount(settlement) {
+  return Math.max(settlementTargetAmount(settlement) - (settlement.matchedAmountMinor ?? 0), 0);
+}
+
+function pushUnique(list, value) {
+  if (value && !list.includes(value)) {
+    list.push(value);
+  }
+}
+
 export class ProjectionStore {
   constructor() {
     this.reset();
@@ -80,6 +94,24 @@ export class ProjectionStore {
       case "ApprovalGranted":
         this.#applyApprovalGranted(event);
         break;
+      case "SettlementInitiated":
+        this.#applySettlementInitiated(event);
+        break;
+      case "SettlementPendingProvider":
+        this.#applySettlementPendingProvider(event);
+        break;
+      case "SettlementConfirmed":
+        this.#applySettlementConfirmed(event);
+        break;
+      case "SettlementFailed":
+        this.#applySettlementFailed(event);
+        break;
+      case "SettlementRetried":
+        this.#applySettlementRetried(event);
+        break;
+      case "SettlementReversed":
+        this.#applySettlementReversed(event);
+        break;
       case "SettlementRecorded":
         this.#applySettlementRecorded(event);
         break;
@@ -97,6 +129,9 @@ export class ProjectionStore {
         break;
       case "AutoMatchApplied":
         this.#applyAutoMatch(event);
+        break;
+      case "PartialMatchApplied":
+        this.#applyPartialMatch(event);
         break;
       case "ReconciliationExceptionOpened":
         this.#applyExceptionOpened(event);
@@ -119,31 +154,53 @@ export class ProjectionStore {
 
   #ensureCase(caseId) {
     const current = this.cases.get(caseId);
-    if (!current) {
-      const fallback = {
-        caseId,
-        batchId: null,
-        lineId: null,
-        externalReference: null,
-        narrative: null,
-        amountMinor: null,
-        currency: null,
-        direction: null,
-        valueDate: null,
-        channelType: null,
-        claimId: null,
-        settlementId: null,
-        status: "OPEN",
-        candidate: null,
-        exception: null,
-        resolution: null,
-        version: 0,
-        updatedAt: new Date(0).toISOString(),
-      };
-      this.cases.set(caseId, fallback);
-      return fallback;
+    if (current) {
+      return current;
     }
-    return current;
+
+    const fallback = {
+      caseId,
+      batchId: null,
+      lineId: null,
+      externalReference: null,
+      narrative: null,
+      amountMinor: null,
+      currency: null,
+      direction: null,
+      valueDate: null,
+      channelType: null,
+      claimId: null,
+      settlementId: null,
+      status: "OPEN",
+      candidate: null,
+      exception: null,
+      resolution: null,
+      matchedAmountMinor: 0,
+      remainingAmountMinor: null,
+      version: 0,
+      updatedAt: new Date(0).toISOString(),
+    };
+    this.cases.set(caseId, fallback);
+    return fallback;
+  }
+
+  #syncConfirmedSettlementState(claim, occurredAt) {
+    if (!claim.settlement || claim.settlement.state !== "confirmed") {
+      return;
+    }
+
+    claim.settlement.outstandingMatchMinor = settlementRemainingAmount(claim.settlement);
+    if (claim.settlement.outstandingMatchMinor === 0 && settlementTargetAmount(claim.settlement) > 0) {
+      claim.reconciliation.status = "MATCHED";
+      claim.status = "RECONCILED";
+    } else if ((claim.settlement.matchedAmountMinor ?? 0) > 0) {
+      claim.reconciliation.status = "PARTIAL";
+      claim.status = "RECON_PARTIAL";
+    } else {
+      claim.reconciliation.status = "PENDING";
+      claim.status = "SETTLED_PENDING_RECON";
+    }
+    claim.updatedAt = occurredAt;
   }
 
   #applyClaimSubmitted(event) {
@@ -193,13 +250,28 @@ export class ProjectionStore {
     const claim = this.#ensureClaim(event.aggregateId);
     claim.settlement = {
       ...event.payload,
-      status: "PROPOSED",
-      proposedAt: event.occurredAt,
-      approvedAt: null,
-      recordedAt: null,
+      workflowStatus: "PROPOSED",
+      state: null,
+      attemptCount: 0,
+      lastAttemptId: null,
+      providerReference: null,
+      pendingReason: null,
+      nextReviewAt: null,
+      confirmedAmountMinor: 0,
+      matchedAmountMinor: 0,
+      outstandingMatchMinor: event.payload.amountMinor,
+      matchedCaseIds: [],
       postingRef: null,
       externalStatus: null,
-      matchedCaseId: null,
+      failure: null,
+      floatAccountRef: null,
+      availableFloatMinor: null,
+      proposedAt: event.occurredAt,
+      approvedAt: null,
+      initiatedAt: null,
+      confirmedAt: null,
+      reversedAt: null,
+      retriedAt: null,
     };
     claim.status = "AWAITING_SETTLEMENT_CHECKER";
     claim.updatedAt = event.occurredAt;
@@ -230,7 +302,7 @@ export class ProjectionStore {
       };
     }
     if (claim.settlement) {
-      claim.settlement.status = "APPROVED";
+      claim.settlement.workflowStatus = "APPROVED";
       claim.settlement.approvedAt = event.occurredAt;
       claim.settlement.checkerActorId = event.payload.checkerActorId;
     }
@@ -239,16 +311,127 @@ export class ProjectionStore {
     claim.version = event.aggregateVersion;
   }
 
+  #applySettlementInitiated(event) {
+    const claim = this.#ensureClaim(event.aggregateId);
+    if (!claim.settlement) {
+      return;
+    }
+    claim.settlement.state = "initiated";
+    claim.settlement.attemptCount = Math.max(claim.settlement.attemptCount ?? 0, event.payload.attemptNumber);
+    claim.settlement.lastAttemptId = event.payload.attemptId;
+    claim.settlement.floatAccountRef = event.payload.floatAccountRef;
+    claim.settlement.availableFloatMinor = event.payload.availableFloatMinor;
+    claim.settlement.initiatedAt = event.occurredAt;
+    claim.settlement.pendingReason = null;
+    claim.settlement.nextReviewAt = null;
+    claim.settlement.failure = null;
+    claim.status = "SETTLEMENT_INITIATED";
+    claim.updatedAt = event.occurredAt;
+    claim.version = event.aggregateVersion;
+  }
+
+  #applySettlementPendingProvider(event) {
+    const claim = this.#ensureClaim(event.aggregateId);
+    if (!claim.settlement) {
+      return;
+    }
+    claim.settlement.state = "pending_provider";
+    claim.settlement.lastAttemptId = event.payload.attemptId;
+    claim.settlement.providerReference = event.payload.providerReference;
+    claim.settlement.pendingReason = event.payload.reason;
+    claim.settlement.nextReviewAt = event.payload.nextReviewAt ?? null;
+    claim.settlement.failure = null;
+    claim.status = "AWAITING_PROVIDER_CONFIRMATION";
+    claim.updatedAt = event.occurredAt;
+    claim.version = event.aggregateVersion;
+  }
+
+  #applySettlementConfirmed(event) {
+    const claim = this.#ensureClaim(event.aggregateId);
+    if (!claim.settlement) {
+      return;
+    }
+    claim.settlement.state = "confirmed";
+    claim.settlement.lastAttemptId = event.payload.attemptId;
+    claim.settlement.providerReference = event.payload.providerReference;
+    claim.settlement.confirmedAmountMinor = event.payload.confirmedAmountMinor;
+    claim.settlement.confirmedAt = event.occurredAt;
+    claim.settlement.providerConfirmedAt = event.payload.providerConfirmedAt;
+    claim.settlement.externalStatus = event.payload.externalStatus;
+    claim.settlement.pendingReason = null;
+    claim.settlement.nextReviewAt = null;
+    claim.settlement.failure = null;
+    this.#syncConfirmedSettlementState(claim, event.occurredAt);
+    claim.version = event.aggregateVersion;
+  }
+
+  #applySettlementFailed(event) {
+    const claim = this.#ensureClaim(event.aggregateId);
+    if (!claim.settlement) {
+      return;
+    }
+    claim.settlement.state = "failed";
+    claim.settlement.lastAttemptId = event.payload.attemptId;
+    claim.settlement.attemptCount = Math.max(claim.settlement.attemptCount ?? 0, event.payload.attemptNumber);
+    claim.settlement.availableFloatMinor = event.payload.availableFloatMinor ?? claim.settlement.availableFloatMinor;
+    claim.settlement.pendingReason = null;
+    claim.settlement.nextReviewAt = null;
+    claim.settlement.failure = {
+      ...event.payload,
+      failedAt: event.occurredAt,
+    };
+    claim.status = "SETTLEMENT_FAILED";
+    claim.updatedAt = event.occurredAt;
+    claim.version = event.aggregateVersion;
+  }
+
+  #applySettlementRetried(event) {
+    const claim = this.#ensureClaim(event.aggregateId);
+    if (!claim.settlement) {
+      return;
+    }
+    claim.settlement.state = "retried";
+    claim.settlement.attemptCount = Math.max(claim.settlement.attemptCount ?? 0, event.payload.nextAttemptNumber);
+    claim.settlement.retriedAt = event.occurredAt;
+    claim.settlement.pendingReason = null;
+    claim.settlement.nextReviewAt = null;
+    claim.settlement.failure = null;
+    claim.status = "SETTLEMENT_RETRIED";
+    claim.updatedAt = event.occurredAt;
+    claim.version = event.aggregateVersion;
+  }
+
+  #applySettlementReversed(event) {
+    const claim = this.#ensureClaim(event.aggregateId);
+    if (!claim.settlement) {
+      return;
+    }
+    claim.settlement.state = "reversed";
+    claim.settlement.reversedAt = event.occurredAt;
+    claim.settlement.reversal = event.payload;
+    claim.settlement.outstandingMatchMinor = 0;
+    claim.settlement.pendingReason = null;
+    claim.settlement.nextReviewAt = null;
+    claim.settlement.failure = null;
+    claim.reconciliation.status = "REVERSED";
+    claim.status = "SETTLEMENT_REVERSED";
+    claim.updatedAt = event.occurredAt;
+    claim.version = event.aggregateVersion;
+  }
+
   #applySettlementRecorded(event) {
     const claim = this.#ensureClaim(event.aggregateId);
-    if (claim.settlement) {
-      claim.settlement.status = "RECORDED";
-      claim.settlement.postingRef = event.payload.postingRef;
-      claim.settlement.recordedAt = event.occurredAt;
-      claim.settlement.externalStatus = event.payload.externalStatus;
+    if (!claim.settlement) {
+      return;
     }
-    claim.status = "SETTLED_PENDING_RECON";
-    claim.updatedAt = event.occurredAt;
+    claim.settlement.workflowStatus = "APPROVED";
+    claim.settlement.state = "confirmed";
+    claim.settlement.postingRef = event.payload.postingRef;
+    claim.settlement.confirmedAmountMinor = event.payload.amountMinor;
+    claim.settlement.confirmedAt = event.occurredAt;
+    claim.settlement.providerConfirmedAt = event.occurredAt;
+    claim.settlement.externalStatus = event.payload.externalStatus;
+    this.#syncConfirmedSettlementState(claim, event.occurredAt);
     claim.version = event.aggregateVersion;
   }
 
@@ -302,6 +485,8 @@ export class ProjectionStore {
       candidate: null,
       exception: null,
       resolution: null,
+      matchedAmountMinor: 0,
+      remainingAmountMinor: event.payload.amountMinor,
       version: event.aggregateVersion,
       updatedAt: event.occurredAt,
     };
@@ -328,9 +513,13 @@ export class ProjectionStore {
 
   #applyAutoMatch(event) {
     const item = this.#ensureCase(event.aggregateId);
+    const matchedAmountMinor = event.payload.matchedAmountMinor ?? item.amountMinor ?? 0;
+    const delta = matchedAmountMinor - (item.matchedAmountMinor ?? 0);
     item.claimId = event.payload.claimId;
     item.settlementId = event.payload.settlementId;
     item.status = "MATCHED";
+    item.matchedAmountMinor = matchedAmountMinor;
+    item.remainingAmountMinor = 0;
     item.exception = null;
     item.resolution = null;
     item.updatedAt = event.occurredAt;
@@ -338,14 +527,37 @@ export class ProjectionStore {
 
     const claim = this.claims.get(event.payload.claimId);
     if (claim) {
-      claim.reconciliation.status = "MATCHED";
-      if (!claim.reconciliation.caseIds.includes(item.caseId)) {
-        claim.reconciliation.caseIds.push(item.caseId);
-      }
+      pushUnique(claim.reconciliation.caseIds, item.caseId);
       if (claim.settlement) {
-        claim.settlement.matchedCaseId = item.caseId;
+        claim.settlement.matchedAmountMinor += Math.max(delta, 0);
+        pushUnique(claim.settlement.matchedCaseIds, item.caseId);
+        this.#syncConfirmedSettlementState(claim, event.occurredAt);
       }
-      claim.status = "RECONCILED";
+      claim.updatedAt = event.occurredAt;
+    }
+  }
+
+  #applyPartialMatch(event) {
+    const item = this.#ensureCase(event.aggregateId);
+    const delta = event.payload.matchedAmountMinor - (item.matchedAmountMinor ?? 0);
+    item.claimId = event.payload.claimId;
+    item.settlementId = event.payload.settlementId;
+    item.status = "PARTIAL_MATCHED";
+    item.matchedAmountMinor = event.payload.matchedAmountMinor;
+    item.remainingAmountMinor = event.payload.remainingAmountMinor;
+    item.exception = null;
+    item.resolution = null;
+    item.updatedAt = event.occurredAt;
+    item.version = event.aggregateVersion;
+
+    const claim = this.claims.get(event.payload.claimId);
+    if (claim) {
+      pushUnique(claim.reconciliation.caseIds, item.caseId);
+      if (claim.settlement) {
+        claim.settlement.matchedAmountMinor += Math.max(delta, 0);
+        pushUnique(claim.settlement.matchedCaseIds, item.caseId);
+        this.#syncConfirmedSettlementState(claim, event.occurredAt);
+      }
       claim.updatedAt = event.occurredAt;
     }
   }
@@ -371,9 +583,7 @@ export class ProjectionStore {
       const claim = this.claims.get(item.claimId);
       if (claim) {
         claim.reconciliation.status = "EXCEPTION";
-        if (!claim.reconciliation.caseIds.includes(item.caseId)) {
-          claim.reconciliation.caseIds.push(item.caseId);
-        }
+        pushUnique(claim.reconciliation.caseIds, item.caseId);
         claim.status = "RECON_EXCEPTION";
         claim.updatedAt = event.occurredAt;
       }
@@ -390,6 +600,26 @@ export class ProjectionStore {
     };
     item.updatedAt = event.occurredAt;
     item.version = event.aggregateVersion;
+
+    if (item.claimId) {
+      const claim = this.claims.get(item.claimId);
+      if (claim) {
+        const stillOpen = [...this.cases.values()].some(
+          (entry) => entry.claimId === item.claimId && entry.status === "EXCEPTION",
+        );
+        if (!stillOpen) {
+          if (claim.settlement?.state === "reversed") {
+            claim.reconciliation.status = "REVERSED";
+            claim.status = "SETTLEMENT_REVERSED";
+          } else if (claim.settlement?.state === "confirmed") {
+            this.#syncConfirmedSettlementState(claim, event.occurredAt);
+          } else {
+            claim.reconciliation.status = "PENDING";
+          }
+        }
+        claim.updatedAt = event.occurredAt;
+      }
+    }
   }
 
   hasCommand(commandId) {
@@ -440,6 +670,9 @@ export class ProjectionStore {
     const payoutTotalMinor = this.ledgerEntries
       .filter((entry) => entry.entryType === "CLAIM_PAYOUT")
       .reduce((sum, entry) => sum + entry.lines.reduce((lineSum, line) => lineSum + line.debitMinor, 0), 0);
+    const payoutReversalTotalMinor = this.ledgerEntries
+      .filter((entry) => entry.entryType === "CLAIM_PAYOUT_REVERSAL")
+      .reduce((sum, entry) => sum + entry.lines.reduce((lineSum, line) => lineSum + line.debitMinor, 0), 0);
 
     return {
       totalClaims: claims.length,
@@ -447,8 +680,12 @@ export class ProjectionStore {
       settledPendingReconciliation: claims.filter((claim) => claim.status === "SETTLED_PENDING_RECON").length,
       reconciledClaims: claims.filter((claim) => claim.status === "RECONCILED").length,
       openExceptions: cases.filter((item) => item.status === "EXCEPTION").length,
+      pendingProviderSettlements: claims.filter((claim) => claim.settlement?.state === "pending_provider").length,
+      failedSettlements: claims.filter((claim) => claim.settlement?.state === "failed").length,
+      reversedSettlements: claims.filter((claim) => claim.settlement?.state === "reversed").length,
       reserveTotalMinor,
       payoutTotalMinor,
+      payoutReversalTotalMinor,
       integrity: this.integrity,
     };
   }
